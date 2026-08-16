@@ -81,7 +81,10 @@
     .chart-grid > .chart-panel:last-child { grid-column: 1 / -1; }
   }
 
-  /* Multi-symbol sections (PAXG / ETH / BTC), spaced well apart */
+  /* Multi-symbol sections (PAXG / ETH / BTC), spaced well apart.
+     Accordion behaviour: only one pair's charts/panels/websockets are ever
+     built and live at once — the header is tappable, the body is collapsed
+     by default, and opening a new pair auto-collapses whichever was open. */
   .symbol-section { margin-top: 64px; }
   .symbol-section:first-child { margin-top: 0; }
   .section-hdr {
@@ -91,12 +94,20 @@
     flex-wrap: wrap;
     gap: 10px;
     padding: 14px 0 12px;
-    margin-bottom: 14px;
+    margin-bottom: 0;
     border-top: 2px solid var(--line);
     border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    user-select: none;
   }
+  .section-hdr:hover .ticker { color: var(--gold-bright); }
   .symbol-section:first-child .section-hdr { border-top: none; padding-top: 0; }
   .section-divider-spacer { height: 8px; }
+  .section-body { display: none; padding-top: 14px; }
+  .symbol-section.open .section-body { display: block; }
+  .section-hdr .fold-chevron { font-size: 13px; }
+  .symbol-section.open .section-hdr .fold-chevron { transform: rotate(90deg); }
+  .section-hdr-sub { font-size: 11px; color: var(--muted); margin-left: 10px; }
 
   .chart-panel { display: flex; flex-direction: column; }
   .panel-hdr {
@@ -190,6 +201,32 @@
   }
   .panel.chart-maximized .fs-switch {
     display: inline-block;
+  }
+
+  /* While a chart is maximized, give the symbol/timeframe switchers + Exit
+     button their own full-width row pinned above the strategy toggle buttons,
+     with bigger touch targets. Previously these two <select> dropdowns sat as
+     plain siblings among 8 other small pill buttons in one wrapping row, so on
+     a phone they could land anywhere and were easy to miss or mis-tap — that's
+     what made the timeframe switcher feel broken even though the click handler
+     itself was fine. */
+  .chart-maximized .panel-hdr-right {
+    order: -1;
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-bottom: 8px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  .chart-maximized .panel-hdr-right .fs-switch {
+    font-size: 13px;
+    padding: 7px 10px;
+    min-height: 34px;
+  }
+  .chart-maximized .panel-hdr-right .sig-toggle-btn.fs {
+    font-size: 12px;
+    padding: 7px 10px;
   }
 
   /* "Maximize" overlay used for the per-chart full-screen button — pure CSS,
@@ -607,7 +644,7 @@ function scaffoldState(symKey) {
       ema50Series: null,
       seenMarkerKeys: new Set(),
       isInitialLoad: true,
-      showSignalText: true,
+      showSignalText: false,
       lastMarkers: [],
       // Strategy 2: confluence-based (sweep + volume + footprint + EMA/VWAP), SL:TP = 1:3, hidden until toggled on
       strat2Markers: [],
@@ -664,18 +701,88 @@ let unreadCount = 0;
 /* ============================================================
    1. BUILD PANELS & LIGHTWEIGHT CHARTS INITIALIZATION
    ============================================================ */
+// Tracks which single main pair (PAXG/ETH/BTC) is currently expanded, and
+// which pairs have had their panels/charts built at least once. Only the
+// open pair keeps live websockets running — closing a section tears its
+// sockets down, opening one (re)connects them. This keeps at most 5 charts
+// (one pair × 5 timeframes) live at a time instead of 15.
+let openMainSymbolKey = null;
+const mainSymbolInited = {};
+
 function createSymbolSection(sym) {
   const section = document.createElement('div');
   section.className = 'symbol-section';
   section.id = 'section-' + sym.key;
   section.innerHTML = `
-    <div class="section-hdr">
-      <div class="ticker">${sym.label}</div>
+    <div class="section-hdr" id="sectionHdr-${sym.key}">
+      <div class="ticker">${sym.label}<span class="section-hdr-sub">tap to open · only one pair live at a time</span></div>
+      <span class="fold-chevron">▶</span>
     </div>
-    <div class="controls" id="controls-${sym.key}"></div>
-    <div class="chart-grid" id="chartGrid-${sym.key}"></div>
+    <div class="section-body" id="sectionBody-${sym.key}">
+      <div class="controls" id="controls-${sym.key}"></div>
+      <div class="chart-grid" id="chartGrid-${sym.key}"></div>
+    </div>
   `;
   document.getElementById('sectionsRoot').appendChild(section);
+  document.getElementById('sectionHdr-' + sym.key).addEventListener('click', () => {
+    toggleMainSymbolSection(sym.key);
+  });
+}
+
+function toggleMainSymbolSection(symKey) {
+  if (openMainSymbolKey === symKey) {
+    closeMainSymbolSection(symKey);
+    openMainSymbolKey = null;
+    return;
+  }
+  if (openMainSymbolKey) closeMainSymbolSection(openMainSymbolKey);
+  openMainSymbolSection(symKey);
+  openMainSymbolKey = symKey;
+}
+
+function openMainSymbolSection(symKey) {
+  document.getElementById('section-' + symKey).classList.add('open');
+  if (!mainSymbolInited[symKey]) {
+    mainSymbolInited[symKey] = true;
+    TIMEFRAMES.forEach(tf => createPanel(symKey, tf));
+    TIMEFRAMES.forEach(tf => initChart(symKey, tf));
+    buildControls(symKey);
+  }
+  // Fresh data + a live socket every time the pair is opened (also covers
+  // reopening a pair whose socket was torn down when it was last closed).
+  TIMEFRAMES.forEach(tf => fetchKlines(symKey, tf));
+}
+
+function closeMainSymbolSection(symKey) {
+  const section = document.getElementById('section-' + symKey);
+  if (!section) return;
+  // If a chart from this pair is currently full-screened, exit that first —
+  // full screen relies on position:fixed, which a display:none ancestor
+  // would otherwise hide entirely.
+  const maxPanel = section.querySelector('.chart-maximized');
+  if (maxPanel) exitPseudoFullscreen(maxPanel);
+  section.classList.remove('open');
+  TIMEFRAMES.forEach(tf => {
+    const s = state[symKey] && state[symKey][tf];
+    if (s && s.ws) {
+      s.ws.onclose = null;
+      s.ws.close();
+      s.ws = null;
+    }
+  });
+}
+
+// Used only by the full-screen symbol-switch dropdown, which can target a
+// pair that hasn't been opened in the accordion yet — builds it lazily
+// without disturbing whichever pair is currently open in the main list.
+function ensureMainSymbolBuilt(symKey) {
+  if (mainSymbolInited[symKey]) return;
+  mainSymbolInited[symKey] = true;
+  document.getElementById('section-' + symKey).classList.add('open');
+  TIMEFRAMES.forEach(tf => createPanel(symKey, tf));
+  TIMEFRAMES.forEach(tf => initChart(symKey, tf));
+  buildControls(symKey);
+  TIMEFRAMES.forEach(tf => fetchKlines(symKey, tf));
 }
 
 function createPanel(symKey, tf) {
@@ -690,20 +797,22 @@ function createPanel(symKey, tf) {
         <span class="chg" id="chg-${symKey}-${tf}">—</span>
       </div>
       <span class="badge connecting" id="status-${symKey}-${tf}"><span class="pulse"></span>CONNECTING…</span>
-      <button class="sig-toggle-btn strat1" id="sigToggle-${symKey}-${tf}" title="Show/hide Strategy 1 markers and signal text on this chart">🏷️ Signals</button>
+      <button class="sig-toggle-btn strat1 off" id="sigToggle-${symKey}-${tf}" title="Show/hide Strategy 1 markers and signal text on this chart — hidden until tapped">🏷️ Signals (hidden)</button>
       <button class="sig-toggle-btn strat2 off" id="strat2Toggle-${symKey}-${tf}" title="Toggle Strategy 2: sweep + volume + footprint + EMA/VWAP confluence, SL:TP 1:3 — hidden until tapped">🎯 Strat 2</button>
       <button class="sig-toggle-btn strat3 off" id="strat3Toggle-${symKey}-${tf}" title="Toggle Strategy 3: lower-timeframe trend cascade (5m→15m→1h→4h→1d), SL/TP to next liquidity — hidden until tapped">🧭 Strat 3</button>
       <button class="sig-toggle-btn strat4 off" id="strat4Toggle-${symKey}-${tf}" title="Toggle Strategy 4 (Liquidity): 1D/4H/1H midpoint breaks confirmed by 5m+15m follow-through, plus liquidity-sweep continuation/fade setups — hidden until tapped">💧 Liquidity</button>
       <button class="sig-toggle-btn strat5 off" id="strat5Toggle-${symKey}-${tf}" title="Toggle Strategy 5 (Long Trade): only fires when sweep + volume + EMA stack + VWAP + higher-timeframe trend ALL agree — fewer signals, each higher-conviction — hidden until tapped">📈 Long Trade</button>
       <button class="sig-toggle-btn strat6 off" id="strat6Toggle-${symKey}-${tf}" title="Toggle Strategy 6 (Squeeze Breakout): fires when price closes out of a tight compression zone on a volume spike, SL at the opposite edge of the zone, TP to next liquidity pivot — hidden until tapped">🌀 Squeeze</button>
       <button class="sig-toggle-btn analyze" id="analyzeBtn-${symKey}-${tf}" title="See which of Strategies 1-6 has the best win rate over its last 5 signals on this chart, right now">🔍 Analyze</button>
-      <select class="fs-switch" id="fsSwitch-${symKey}-${tf}" title="Switch symbol — stays in fullscreen, same ${tf.toUpperCase()} timeframe">
-        ${SYMBOLS.map(s => `<option value="${s.key}"${s.key === symKey ? ' selected' : ''}>${s.label}</option>`).join('')}
-      </select>
-      <select class="fs-switch" id="fsTfSwitch-${symKey}-${tf}" title="Switch timeframe — stays in fullscreen, same symbol">
-        ${TIMEFRAMES.map(t => `<option value="${t}"${t === tf ? ' selected' : ''}>${t.toUpperCase()}</option>`).join('')}
-      </select>
-      <button class="sig-toggle-btn fs" id="fsToggle-${symKey}-${tf}" title="Open this chart full screen">⛶ Full</button>
+      <div class="panel-hdr-right">
+        <select class="fs-switch" id="fsSwitch-${symKey}-${tf}" title="Switch symbol — stays in fullscreen, same ${tf.toUpperCase()} timeframe">
+          ${SYMBOLS.map(s => `<option value="${s.key}"${s.key === symKey ? ' selected' : ''}>${s.label}</option>`).join('')}
+        </select>
+        <select class="fs-switch" id="fsTfSwitch-${symKey}-${tf}" title="Switch timeframe — stays in fullscreen, same symbol">
+          ${TIMEFRAMES.map(t => `<option value="${t}"${t === tf ? ' selected' : ''}>${t.toUpperCase()}</option>`).join('')}
+        </select>
+        <button class="sig-toggle-btn fs" id="fsToggle-${symKey}-${tf}" title="Open this chart full screen">⛶ Full</button>
+      </div>
     </div>
     <div class="analyze-popup" id="analyzePopup-${symKey}-${tf}"></div>
     <div class="chart-container" id="container-${symKey}-${tf}"></div>
@@ -819,7 +928,31 @@ function resizeAllCharts() {
     });
   });
 }
-window.addEventListener('resize', resizeAllCharts);
+// Debounce the window resize handler — mobile browsers fire a burst of resize
+// events (address bar show/hide, rotation), and each one used to walk every
+// symbol ever loaded (3 main + up to 150+ from the expandable coin lists).
+let _resizeDebounceTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_resizeDebounceTimer);
+  _resizeDebounceTimer = setTimeout(resizeAllCharts, 120);
+});
+
+// Resize/relabel just one symbol's charts. Entering/exiting fullscreen only
+// changes layout within that symbol's own chart-grid (each symbol section has
+// its own grid, and a position:fixed maximized panel is taken out of flow
+// globally either way) — so there's no need to touch every other symbol's
+// charts, including ones from the Top 50 / Alpha token lists a user may have
+// opened elsewhere on the page. Walking all of those on every fullscreen
+// toggle was unnecessary work and part of why fullscreen felt slow.
+function resizeChartsForSymbol(symKey) {
+  TIMEFRAMES.forEach(tf => {
+    const s = state[symKey][tf];
+    if (s && s.chart && s.container) {
+      s.chart.applyOptions({ width: s.container.clientWidth, height: s.container.clientHeight });
+      renderLabelOverlay(symKey, tf);
+    }
+  });
+}
 
 /* ============================================================
    FULLSCREEN — per-chart, CSS-driven "maximize" overlay.
@@ -837,14 +970,16 @@ window.addEventListener('resize', resizeAllCharts);
 function enterPseudoFullscreen(panel) {
   panel.classList.add('chart-maximized');
   document.body.classList.add('has-maximized-chart');
-  requestAnimationFrame(() => requestAnimationFrame(resizeAllCharts));
+  const symKey = panel.id.replace(/^panel-/, '').split('-')[0];
+  requestAnimationFrame(() => requestAnimationFrame(() => resizeChartsForSymbol(symKey)));
   updateFsButtons();
 }
 
 function exitPseudoFullscreen(panel) {
   panel.classList.remove('chart-maximized');
   document.body.classList.remove('has-maximized-chart');
-  requestAnimationFrame(() => requestAnimationFrame(resizeAllCharts));
+  const symKey = panel.id.replace(/^panel-/, '').split('-')[0];
+  requestAnimationFrame(() => requestAnimationFrame(() => resizeChartsForSymbol(symKey)));
   updateFsButtons();
 }
 
@@ -878,6 +1013,8 @@ function switchFullscreenChart(currentSymKey, currentTf, newSymKey, newTf) {
   newSymKey = newSymKey || currentSymKey;
   newTf = newTf || currentTf;
   if (newSymKey === currentSymKey && newTf === currentTf) return;
+
+  if (newSymKey !== currentSymKey) ensureMainSymbolBuilt(newSymKey);
 
   const oldPanel = document.getElementById('panel-' + currentSymKey + '-' + currentTf);
   const newPanel = document.getElementById('panel-' + newSymKey + '-' + newTf);
@@ -2181,7 +2318,52 @@ document.addEventListener('click', (e) => {
   }
 });
 
-function updateChartData(symKey, tf) {
+// Recompute cadence for the expensive path (indicators + all 6 strategies over
+// the full candle history). Live ticks arrive far more often than this, so they
+// take the cheap path below and this just caps how often the heavy work runs.
+const RECALC_THROTTLE_MS = 1000;
+
+function scheduleFullRecalc(symKey, tf) {
+  const s = state[symKey][tf];
+  if (s._recalcTimer) return; // a recalc is already queued, let it fire
+  s._recalcTimer = setTimeout(() => {
+    s._recalcTimer = null;
+    fullRecalc(symKey, tf);
+  }, RECALC_THROTTLE_MS);
+}
+
+// opts.tickOnly = true means "only the still-forming last candle changed price,
+// no new bar opened." That's the overwhelming majority of updates (Binance's
+// kline stream pushes several messages per second per symbol/timeframe while a
+// candle is live). Previously every one of those messages re-ran setData() on
+// 5 full series (up to 500 points each) AND recomputed all 6 strategies over
+// the whole history, for all 15 charts — that repeated, unthrottled full
+// recompute was the main reason the dashboard (and fullscreen, being the
+// biggest/most-watched chart) felt slow. Now a tick just nudges the one bar
+// that changed via the chart's native .update(), and the expensive indicator/
+// strategy recompute is throttled to at most once per second.
+function updateChartData(symKey, tf, opts) {
+  opts = opts || {};
+  const s = state[symKey][tf];
+
+  if (opts.tickOnly && s._everFullyRendered && s.candles.length) {
+    const last = s.candles[s.candles.length - 1];
+    s.candlestickSeries.update({ time: last.time, open: last.open, high: last.high, low: last.low, close: last.close });
+    s.volumeSeries.update({
+      time: last.time,
+      value: last.volume,
+      color: last.close >= last.open ? 'rgba(62, 207, 142, 0.4)' : 'rgba(239, 91, 107, 0.4)'
+    });
+    updateHeader(symKey, tf);
+    scheduleFullRecalc(symKey, tf);
+    return;
+  }
+
+  if (s._recalcTimer) { clearTimeout(s._recalcTimer); s._recalcTimer = null; }
+  fullRecalc(symKey, tf);
+}
+
+function fullRecalc(symKey, tf) {
   const s = state[symKey][tf];
   s.candlestickSeries.setData(s.candles.map(c => ({
     time: c.time, open: c.open, high: c.high, low: c.low, close: c.close
@@ -2205,6 +2387,7 @@ function updateChartData(symKey, tf) {
   processStrategy5(symKey, tf);
   processStrategy6(symKey, tf);
   updateHeader(symKey, tf);
+  s._everFullyRendered = true;
 }
 
 /* ============================================================
@@ -2266,15 +2449,25 @@ function connectWebSocket(symKey, tf) {
       volume: parseFloat(k.v)
     };
 
-    const lastIdx = s.candles.findIndex(c => c.time === candleObj.time);
-    if (lastIdx !== -1) {
-      s.candles[lastIdx] = candleObj;
+    // The forming candle is (almost) always the last one in the array, so check
+    // that directly instead of scanning the whole array on every single message.
+    const lastCandle = s.candles[s.candles.length - 1];
+    const isPriceTick = !!lastCandle && lastCandle.time === candleObj.time;
+    if (isPriceTick) {
+      s.candles[s.candles.length - 1] = candleObj;
     } else {
-      s.candles.push(candleObj);
-      if (s.candles.length > MAX_CANDLES) s.candles.shift();
+      const dupeIdx = s.candles.findIndex(c => c.time === candleObj.time);
+      if (dupeIdx !== -1) {
+        s.candles[dupeIdx] = candleObj;
+      } else {
+        s.candles.push(candleObj);
+        if (s.candles.length > MAX_CANDLES) s.candles.shift();
+      }
     }
 
-    updateChartData(symKey, tf);
+    // Binance streams several messages per second while a candle is forming —
+    // only treat it as a full update when a brand-new bar just opened.
+    updateChartData(symKey, tf, { tickOnly: isPriceTick });
   };
 
   s.ws.onerror = () => setStatus(symKey, tf, 'sim');
@@ -2416,7 +2609,9 @@ function startSimulatedTicker(symKey, tf) {
     const bucketStart = Math.floor(now / tfSeconds) * tfSeconds;
     const vol = Math.max(last.close * 0.01, 0.0000001);
     const delta = (Math.random() - 0.5) * vol;
+    let isNewCandle = false;
     if (bucketStart > last.time) {
+      isNewCandle = true;
       const open = last.close;
       const close = Math.max(0.0000001, open + delta);
       s.candles.push({
@@ -2430,7 +2625,7 @@ function startSimulatedTicker(symKey, tf) {
       last.low = Math.min(last.low, last.close);
       last.volume += Math.random() * 500;
     }
-    updateChartData(symKey, tf);
+    updateChartData(symKey, tf, { tickOnly: !isNewCandle });
   }, 4000);
 }
 
@@ -2521,12 +2716,11 @@ document.getElementById('legend').innerHTML = `
    timeframe within it, then load data. Sections render in order
    (PAXG/USDT, ETH/USDT, BTC/USDT) with clear spacing between them.
    ============================================================ */
-SYMBOLS.forEach(sym => {
-  createSymbolSection(sym);
-  TIMEFRAMES.forEach(tf => createPanel(sym.key, tf));
-  TIMEFRAMES.forEach(tf => initChart(sym.key, tf));
-  buildControls(sym.key);
-});
+// Build just the (collapsed) headers for PAXG/ETH/BTC — no panels, no charts,
+// no network calls yet. Each pair's charts + websockets only get built and
+// connected the moment its header is tapped, and only one pair is ever open
+// at a time (see toggleMainSymbolSection above).
+SYMBOLS.forEach(sym => createSymbolSection(sym));
 
 // Folding menus, appended last — collapsed by default, nothing inside built
 // or fetched until tapped open (see section 6 above).
@@ -2535,9 +2729,10 @@ buildFoldingGroup(FUTURES_ONLY_COINS, { id: 'futuresonly', title: '📉 Binance 
 buildFoldingGroup(ALPHA_TOKENS, { id: 'alpha', title: '🧪 Binance Alpha Tokens (50)', note: 'Unofficial · Simulated Data', simulated: true });
 
 renderNotifications();
-SYMBOLS.forEach(sym => {
-  TIMEFRAMES.forEach(tf => fetchKlines(sym.key, tf));
-});
+
+// Open the first pair by default so there's always something live on load;
+// the other two stay collapsed until tapped.
+toggleMainSymbolSection(SYMBOLS[0].key);
 </script>
 </body>
 </html>
